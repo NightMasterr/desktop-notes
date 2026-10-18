@@ -1,0 +1,58 @@
+# Builds the Windows installer and attaches it to a GitHub Release.
+# Runs automatically when a tag like v1.0.1 is created, or by hand:
+# Actions -> "Release Windows app" -> Run workflow -> type an existing tag (e.g. v1.0.0).
+name: Release Windows app
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to attach the installer to (e.g. v1.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: python -m pip install flask pywebview pyinstaller
+
+      - name: Build the app
+        run: python -m PyInstaller --noconfirm --clean --windowed --onedir --name Notes --icon notes.ico --add-data "index.html;." --add-data "style.css;." --add-data "fonts;fonts" notes_desktop.py
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $ver = $env:TAG.TrimStart("v")
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$ver" installer.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Attach to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VER="${TAG#v}"
+          FILE="output/Notes-Setup-$VER.exe"
+          for i in 1 2 3; do
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              gh release upload "$TAG" "$FILE" --clobber && break
+            else
+              gh release create "$TAG" "$FILE" --title "Notes $VER" --notes "Notes $VER" && break
+            fi
+            sleep 10
+          done

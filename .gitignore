@@ -1,0 +1,6 @@
+dist/
+build/
+output/
+__pycache__/
+*.spec
+notes.json

@@ -1,0 +1,589 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Notes</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <h1>Notes</h1>
+      <button class="new-btn" id="newBtn">New note</button>
+    </div>
+    <input class="search" id="search" type="search" placeholder="Search notes" aria-label="Search notes">
+    <div class="viewbar hidden" id="viewbar"><span id="viewName"></span><button id="emptyBin" class="hidden">Empty recycle</button></div>
+    <div class="list" id="list"></div>
+    <div class="dock">
+      <button id="archiveBtn">Archive</button>
+      <button id="binBtn">Recycle</button>
+    </div>
+  </aside>
+
+  <main class="editor">
+    <div class="welcome" id="welcome">
+      <h2>Nothing open</h2>
+      <p>Pick a note from the list, or start a new one.</p>
+    </div>
+    <div class="toolbar hidden" id="toolbar">
+      <div class="swatches" id="swatches"></div>
+      <span class="status" id="status"></span>
+    </div>
+    <div class="page hidden" id="page">
+      <div class="titlerow">
+        <input class="title" id="title" placeholder="Untitled" aria-label="Note heading">
+      </div>
+      <textarea class="body" id="body" placeholder="Start writing..." aria-label="Note body"></textarea>
+    </div>
+  </main>
+  <div class="divider" id="divider" title="Drag to resize. Double-click to reset"></div>
+
+  <div class="menu hidden" id="menu"></div>
+  <div class="toast" id="toast"></div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const COLORS = ["sage", "sky", "lilac", "sun", "rose", "peach", "coral", "lime", "mint", "aqua", "periwinkle", "stone"];
+    const LOCK_SVG = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>';
+
+    let notes = [];
+    let currentId = null;
+    let view = "notes"; // notes | archive | bin
+    let saveTimer = null, toastTimer = null, dragId = null, pending = null;
+
+    const api = async (url, method = "GET", body) => {
+      const res = await fetch(url, {
+        method,
+        headers: { "Content-Type": "application/json" },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      return res.json();
+    };
+
+    const current = () => notes.find((n) => n.id === currentId);
+    const nameOf = (n) => n.label || n.title || "Untitled";
+    const fmtDate = (ts) =>
+      new Date(ts * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+
+    function toast(msg) {
+      const t = $("toast");
+      t.textContent = msg;
+      t.classList.add("show");
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => t.classList.remove("show"), 1800);
+    }
+
+    /* ---------- order: pinned block fixed on top, the rest by activity ---------- */
+    function bump(n) { // move a note to the top of the unpinned notes
+      const top = Math.max(0, ...notes.map((x) => x.sort || 0));
+      n.sort = Math.max(Date.now() / 1000, top + 0.001);
+    }
+
+    function setField(n, fields) {
+      Object.assign(n, fields);
+      return api(`/api/notes/${n.id}`, "PUT", fields);
+    }
+
+    function inView(n) {
+      if (view === "bin") return n.deleted;
+      if (n.deleted) return false;
+      return view === "archive" ? n.archived : !n.archived;
+    }
+
+    function visibleNotes() {
+      const q = $("search").value.trim().toLowerCase();
+      return notes
+        .filter(inView)
+        .filter((n) => (n.label + " " + n.title + " " + n.body).toLowerCase().includes(q))
+        .sort((a, b) => (b.pinned - a.pinned) || (a.pinned ? a.pin_order - b.pin_order : b.sort - a.sort));
+    }
+
+    function placeNote(id, targetId, after) {
+      const n = notes.find((x) => x.id === id);
+      if (!n) return;
+      const group = visibleNotes().filter((x) => x.pinned === n.pinned && x.id !== id);
+      const i = group.findIndex((x) => x.id === targetId);
+      if (i < 0) return;
+      const at = after ? i + 1 : i;
+      const prev = group[at - 1], next = group[at];
+      let fields;
+      if (n.pinned) { // pinned: ascending pin_order
+        const lo = prev ? prev.pin_order : next ? next.pin_order - 2 : 0;
+        const hi = next ? next.pin_order : prev ? prev.pin_order + 2 : 0;
+        fields = { pin_order: (lo + hi) / 2 };
+      } else { // unpinned: descending sort
+        const hi = prev ? prev.sort : next ? next.sort + 2 : 0;
+        const lo = next ? next.sort : prev ? prev.sort - 2 : 0;
+        fields = { sort: (lo + hi) / 2 };
+      }
+      setField(n, fields);
+      renderList();
+    }
+
+    function moveBy(dir) {
+      const n = current();
+      if (!n) return;
+      const g = visibleNotes().filter((x) => x.pinned === n.pinned);
+      const t = g[g.findIndex((x) => x.id === n.id) + dir];
+      if (t) placeNote(n.id, t.id, dir > 0);
+    }
+
+    /* ---------- list ---------- */
+    function clearDrop() {
+      document.querySelectorAll(".drop-above,.drop-below").forEach((c) => c.classList.remove("drop-above", "drop-below"));
+    }
+
+    function renderList(forceFocus = false) {
+      const list = $("list");
+      const hadFocus = forceFocus || list.contains(document.activeElement);
+      const shown = visibleNotes();
+      const searching = !!$("search").value.trim();
+      list.innerHTML = "";
+
+      $("viewName").textContent =
+        (view === "archive" ? "Archive" : "Recycle") + " \u00b7 " + notes.filter(inView).length + " notes";
+
+      if (!shown.length) {
+        const msg = searching ? "No notes match your search."
+          : view === "bin" ? "Recycle is empty."
+          : view === "archive" ? "No archived notes."
+          : "No notes yet. Select New note to write your first one.";
+        list.innerHTML = `<div class="empty-list">${msg}</div>`;
+      }
+
+      let prev = null;
+      shown.forEach((n) => {
+        const card = document.createElement("button");
+        card.className = "card" + (n.id === currentId ? " active" : "");
+        card.dataset.color = n.color;
+        if (prev && prev.pinned && !n.pinned) card.classList.add("after-pins");
+        prev = n;
+
+        const row = document.createElement("div");
+        row.className = "row";
+        const h = document.createElement("h3");
+        h.textContent = (n.pinned ? "\u{1F4CC} " : "") + nameOf(n);
+        row.appendChild(h);
+        if (n.locked) {
+          const l = document.createElement("span");
+          l.className = "lock";
+          l.innerHTML = LOCK_SVG;
+          row.appendChild(l);
+        }
+        const t = document.createElement("time");
+        t.textContent = fmtDate(n.updated);
+        card.append(row, t);
+
+        card.onclick = () => openNote(n.id, true);
+        card.oncontextmenu = (e) => {
+          e.preventDefault();
+          openNote(n.id, false);
+          showMenu(e.clientX, e.clientY);
+        };
+
+        if (view !== "bin" && !searching) { // drag to reorder (inside the pinned block, or among the rest)
+          card.draggable = true;
+          card.addEventListener("dragstart", (e) => {
+            dragId = n.id;
+            e.dataTransfer.effectAllowed = "move";
+            e.dataTransfer.setData("text/plain", n.id);
+            card.classList.add("dragging");
+          });
+          card.addEventListener("dragend", () => { dragId = null; clearDrop(); card.classList.remove("dragging"); });
+          card.addEventListener("dragover", (e) => {
+            const d = notes.find((x) => x.id === dragId);
+            if (!d || d.id === n.id || d.pinned !== n.pinned) return;
+            e.preventDefault();
+            const r = card.getBoundingClientRect();
+            clearDrop();
+            card.classList.add(e.clientY > r.top + r.height / 2 ? "drop-below" : "drop-above");
+          });
+          card.addEventListener("drop", (e) => {
+            const d = notes.find((x) => x.id === dragId);
+            if (!d || d.id === n.id || d.pinned !== n.pinned) return;
+            e.preventDefault();
+            const r = card.getBoundingClientRect();
+            dragId = null;
+            clearDrop();
+            placeNote(d.id, n.id, e.clientY > r.top + r.height / 2);
+          });
+        }
+        list.appendChild(card);
+      });
+
+      if (hadFocus) {
+        const active = list.querySelector(".card.active");
+        if (active) active.focus();
+      }
+    }
+
+    /* ---------- editor ---------- */
+    function autosize() {
+      const b = $("body"), p = $("page"), st = p.scrollTop;
+      b.style.height = "auto";
+      b.style.height = b.scrollHeight + "px";
+      p.scrollTop = st;
+    }
+
+    function showEditor(on) {
+      $("welcome").classList.toggle("hidden", on);
+      $("toolbar").classList.toggle("hidden", !on);
+      $("page").classList.toggle("hidden", !on);
+    }
+
+    function openNote(id, focusList = false) {
+      currentId = id;
+      pending = null;
+      const n = current();
+      if (!n) { showEditor(false); renderList(); return; }
+      showEditor(true);
+      const frozen = n.locked || n.deleted;
+      $("title").value = n.title;
+      $("body").value = n.body;
+      $("title").readOnly = $("body").readOnly = frozen;
+      $("status").textContent = n.deleted ? "In Recycle" : n.locked ? "Locked" : "";
+      document.querySelectorAll(".swatch").forEach((s) => {
+        s.classList.toggle("on", s.dataset.color === n.color);
+        s.disabled = frozen;
+      });
+      autosize();
+      renderList(focusList);
+    }
+
+    function queueSave() {
+      const n = current();
+      if (!n || n.locked || n.deleted) return;
+      n.title = $("title").value;
+      n.body = $("body").value;
+      n.updated = Date.now() / 1000;
+      if (!n.pinned) bump(n);
+      $("status").textContent = "Saving...";
+      autosize();
+      renderList();
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(async () => {
+        await api(`/api/notes/${n.id}`, "PUT", { title: n.title, body: n.body, sort: n.sort });
+        $("status").textContent = "Saved";
+      }, 500);
+    }
+
+    // Select words, press Shift+Enter: they become the name in the sidebar.
+    function nameFromSelection(e) {
+      if (e.key !== "Enter" || !e.shiftKey) return;
+      const el = e.target;
+      const text = el.value.slice(el.selectionStart, el.selectionEnd).replace(/\s+/g, " ").trim();
+      const n = current();
+      if (!text || !n || n.locked || n.deleted) return; // nothing selected: normal new line
+      e.preventDefault();
+      bump(n);
+      setField(n, { label: text.slice(0, 80), sort: n.sort });
+      renderList();
+      toast("Sidebar name set");
+    }
+
+    /* ---------- click and type anywhere (Word style) ---------- */
+    const mirror = document.createElement("div");
+    mirror.style.cssText = "position:absolute;visibility:hidden;left:-9999px;top:0;white-space:pre-wrap;overflow-wrap:break-word;";
+    document.body.appendChild(mirror);
+
+    function prep() {
+      const b = $("body"), cs = getComputedStyle(b);
+      ["fontFamily", "fontSize", "fontWeight", "lineHeight", "letterSpacing",
+       "paddingTop", "paddingRight", "paddingBottom", "paddingLeft"].forEach((p) => (mirror.style[p] = cs[p]));
+      mirror.style.width = b.clientWidth + "px";
+      return cs;
+    }
+
+    function caretAt(index) { // where the caret for text position `index` is drawn
+      prep();
+      mirror.textContent = $("body").value.slice(0, index);
+      const s = document.createElement("span");
+      s.textContent = "\u200b";
+      mirror.appendChild(s);
+      return { x: s.offsetLeft, y: s.offsetTop };
+    }
+
+    function spaceWidth() {
+      prep();
+      mirror.textContent = "";
+      const s = document.createElement("span");
+      s.textContent = "\u00a0".repeat(20);
+      mirror.appendChild(s);
+      return s.getBoundingClientRect().width / 20;
+    }
+
+    $("body").addEventListener("click", (e) => {
+      pending = null;
+      const b = $("body");
+      if (b.readOnly || b.selectionStart !== b.selectionEnd) return;
+      const cs = prep(), r = b.getBoundingClientRect();
+      const x = e.clientX - r.left, y = e.clientY - r.top;
+      const lineH = parseFloat(cs.lineHeight) || parseFloat(cs.fontSize) * 1.7;
+      const padT = parseFloat(cs.paddingTop), padL = parseFloat(cs.paddingLeft), padR = parseFloat(cs.paddingRight);
+      const sp = spaceWidth();
+      const room = (fromX) => Math.max(0, Math.floor((b.clientWidth - padR - fromX) / sp) - 1);
+      const row = Math.floor((y - padT) / lineH);
+      const y0 = caretAt(0).y;
+      const end = caretAt(b.value.length);
+      const endRow = Math.round((end.y - y0) / lineH);
+
+      if (row > endRow) { // clicked below the last line: add lines when you start typing
+        b.setSelectionRange(b.value.length, b.value.length);
+        pending = { pos: b.value.length, lines: row - endRow, spaces: Math.min(Math.max(0, Math.round((x - padL) / sp)), room(padL)) };
+      } else {
+        const c = caretAt(b.selectionStart);
+        if (Math.round((c.y - y0) / lineH) === row && x - c.x > sp * 1.5) { // clicked right of the line's end
+          pending = { pos: b.selectionStart, lines: 0, spaces: Math.min(Math.round((x - c.x) / sp), room(c.x)) };
+        }
+      }
+    });
+
+    $("body").addEventListener("beforeinput", (e) => {
+      if (!pending) return;
+      const b = $("body"), p = pending;
+      pending = null;
+      const ins = e.inputType === "insertText" ? e.data
+        : (e.inputType === "insertParagraph" || e.inputType === "insertLineBreak") ? "\n" : null;
+      if (ins === null || b.selectionStart !== p.pos) return;
+      e.preventDefault();
+      b.setRangeText("\n".repeat(p.lines) + " ".repeat(p.spaces) + ins, p.pos, p.pos, "end");
+      queueSave();
+    });
+
+    $("body").addEventListener("keydown", (e) => {
+      if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown"].includes(e.key)) pending = null;
+    });
+
+    /* ---------- actions ---------- */
+    function after(fn) { // run a change, then open the neighbouring note
+      const idx = visibleNotes().findIndex((n) => n.id === currentId);
+      fn();
+      const now = visibleNotes();
+      const next = now[Math.min(idx, now.length - 1)];
+      if (next) openNote(next.id); else { currentId = null; showEditor(false); renderList(); }
+    }
+
+    function isLocked(n) {
+      if (n.locked) toast("This note is locked. Unlock it first.");
+      return n.locked;
+    }
+
+    function togglePin() {
+      const n = current();
+      if (!n || n.deleted) return;
+      if (n.pinned) {
+        bump(n);
+        setField(n, { pinned: false, sort: n.sort });
+        toast("Unpinned");
+      } else {
+        const mx = Math.max(0, ...notes.filter((x) => x.pinned).map((x) => x.pin_order || 0));
+        setField(n, { pinned: true, pin_order: mx + 1 });
+        toast("Pinned");
+      }
+      renderList();
+    }
+
+    function toggleArchive() {
+      const n = current();
+      if (!n || n.deleted || isLocked(n)) return;
+      const to = !n.archived;
+      after(() => {
+        const f = { archived: to };
+        if (!to) { bump(n); f.sort = n.sort; }
+        setField(n, f);
+      });
+      toast(to ? "Archived" : "Moved back to notes");
+    }
+
+    function toggleLock() {
+      const n = current();
+      if (!n || n.deleted) return;
+      setField(n, { locked: !n.locked });
+      openNote(n.id, $("list").contains(document.activeElement));
+      toast(n.locked ? "Locked" : "Unlocked");
+    }
+
+    function deleteNote() {
+      const n = current();
+      if (!n || isLocked(n)) return;
+      if (n.deleted) {
+        if (!confirm("Delete this note forever? This can't be undone.")) return;
+        after(() => { notes = notes.filter((x) => x.id !== n.id); api(`/api/notes/${n.id}`, "DELETE"); });
+        toast("Deleted forever");
+      } else {
+        after(() => setField(n, { deleted: true }));
+        toast("Moved to Recycle");
+      }
+    }
+
+    function restoreNote() {
+      const n = current();
+      if (!n || !n.deleted) return;
+      after(() => { bump(n); setField(n, { deleted: false, sort: n.sort }); });
+      toast("Restored");
+    }
+
+    function resetName() {
+      const n = current();
+      if (!n || isLocked(n)) return;
+      bump(n);
+      setField(n, { label: "", sort: n.sort });
+      renderList();
+    }
+
+    function setView(v) {
+      view = view === v ? "notes" : v;
+      currentId = null;
+      showEditor(false);
+      $("viewbar").classList.toggle("hidden", view === "notes");
+      $("emptyBin").classList.toggle("hidden", view !== "bin");
+      $("sidebar").classList.toggle("view-archive", view === "archive");
+      $("sidebar").classList.toggle("view-bin", view === "bin");
+      $("archiveBtn").classList.toggle("on", view === "archive");
+      $("binBtn").classList.toggle("on", view === "bin");
+      renderList();
+    }
+
+    /* ---------- right-click menu ---------- */
+    function showMenu(x, y) {
+      const n = current();
+      if (!n) return;
+      const items = n.deleted
+        ? [["Restore", restoreNote], ["Delete forever", deleteNote, true]]
+        : [
+            [n.pinned ? "Unpin" : "Pin", togglePin],
+            [n.archived ? "Unarchive" : "Archive", toggleArchive, false, n.locked],
+            [n.locked ? "Unlock" : "Lock", toggleLock],
+            ...(n.label ? [["Reset sidebar name", resetName, false, n.locked]] : []),
+            ["Delete", deleteNote, true, n.locked],
+          ];
+      const menu = $("menu");
+      menu.innerHTML = "";
+      items.forEach(([label, fn, danger, disabled]) => {
+        const b = document.createElement("button");
+        b.textContent = label;
+        if (danger) b.className = "danger";
+        b.disabled = !!disabled;
+        b.onclick = () => { hideMenu(); fn(); };
+        menu.appendChild(b);
+      });
+      menu.classList.remove("hidden");
+      menu.style.left = Math.min(x, window.innerWidth - menu.offsetWidth - 8) + "px";
+      menu.style.top = Math.min(y, window.innerHeight - menu.offsetHeight - 8) + "px";
+    }
+    const hideMenu = () => $("menu").classList.add("hidden");
+    document.addEventListener("click", hideMenu);
+    document.addEventListener("scroll", hideMenu, true);
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape") hideMenu(); });
+    window.addEventListener("resize", () => { hideMenu(); autosize(); });
+
+    /* ---------- keyboard (only while the list is focused) ---------- */
+    $("list").addEventListener("keydown", (e) => {
+      if (e.ctrlKey || e.metaKey) return;
+      const k = e.key.toLowerCase();
+      if (e.altKey) {
+        if (k === "arrowup" || k === "arrowdown") { moveBy(k === "arrowdown" ? 1 : -1); e.preventDefault(); }
+        return;
+      }
+      if (k === "delete") deleteNote();
+      else if (k === "p") togglePin();
+      else if (k === "a") toggleArchive();
+      else if (k === "l") toggleLock();
+      else if (k === "r") restoreNote();
+      else if (k === "arrowdown" || k === "arrowup") {
+        const list = visibleNotes();
+        const i = list.findIndex((n) => n.id === currentId);
+        const next = list[i + (k === "arrowdown" ? 1 : -1)];
+        if (next) openNote(next.id, true);
+      } else return;
+      e.preventDefault();
+    });
+
+    /* ---------- wiring ---------- */
+    COLORS.forEach((c) => {
+      const s = document.createElement("button");
+      s.className = "swatch";
+      s.dataset.color = c;
+      s.setAttribute("aria-label", c);
+      s.onclick = async () => {
+        const n = current();
+        if (!n || n.locked || n.deleted) return;
+        bump(n);
+        await setField(n, { color: c, sort: n.sort });
+        document.querySelectorAll(".swatch").forEach((x) => x.classList.toggle("on", x === s));
+        renderList();
+      };
+      $("swatches").appendChild(s);
+    });
+
+    $("newBtn").onclick = async () => {
+      const note = await api("/api/notes", "POST", { title: "", body: "" });
+      notes.push(note);
+      if (view !== "notes") setView(view);
+      $("search").value = "";
+      openNote(note.id);
+      $("title").focus();
+    };
+
+    $("title").addEventListener("input", queueSave);
+    $("body").addEventListener("input", queueSave);
+    $("title").addEventListener("keydown", nameFromSelection);
+    $("body").addEventListener("keydown", nameFromSelection);
+    $("search").addEventListener("input", () => renderList());
+
+    $("archiveBtn").onclick = () => setView("archive");
+    $("binBtn").onclick = () => setView("bin");
+    $("emptyBin").onclick = async () => {
+      if (!notes.some((n) => n.deleted && !n.locked)) return;
+      if (!confirm("Delete everything in Recycle forever?")) return;
+      await api("/api/bin", "DELETE");
+      notes = notes.filter((n) => !(n.deleted && !n.locked));
+      currentId = null;
+      showEditor(false);
+      renderList();
+      toast("Recycle emptied");
+    };
+
+    // draggable sidebar width (remembered; double-click the divider to reset)
+    const SIDE_KEY = "notes.sidebarWidth";
+    const setSide = (px) => document.documentElement.style.setProperty("--side", px + "px");
+    try { const saved = parseInt(localStorage.getItem(SIDE_KEY), 10); if (saved >= 240) setSide(saved); } catch (err) {}
+    const divider = $("divider");
+    divider.addEventListener("pointerdown", (e) => {
+      divider.setPointerCapture(e.pointerId);
+      divider.classList.add("drag");
+      document.body.style.userSelect = "none";
+    });
+    divider.addEventListener("pointermove", (e) => {
+      if (!divider.classList.contains("drag")) return;
+      const max = Math.min(720, window.innerWidth * 0.5);
+      setSide(Math.round(Math.max(240, Math.min(max, e.clientX - 16))));
+      autosize();
+    });
+    const endDrag = () => {
+      if (!divider.classList.contains("drag")) return;
+      divider.classList.remove("drag");
+      document.body.style.userSelect = "";
+      try { localStorage.setItem(SIDE_KEY, String(Math.round($("sidebar").getBoundingClientRect().width))); } catch (err) {}
+    };
+    divider.addEventListener("pointerup", endDrag);
+    divider.addEventListener("pointercancel", endDrag);
+    divider.addEventListener("dblclick", () => {
+      document.documentElement.style.removeProperty("--side");
+      try { localStorage.removeItem(SIDE_KEY); } catch (err) {}
+      autosize();
+    });
+
+    // heartbeat: lets the quiet "browser" mode shut itself down after the tab is closed
+    const ping = () => fetch("/api/ping").catch(() => {});
+    ping();
+    setInterval(ping, 5000);
+
+    (async function init() {
+      notes = await api("/api/notes");
+      renderList();
+    })();
+  </script>
+</body>
+</html>
